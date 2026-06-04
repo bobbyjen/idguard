@@ -1,0 +1,32 @@
+# Credentials — NEVER commit these
+secrets/
+.env
+
+# PostgreSQL data volume
+data/
+
+# Node dependencies
+node_modules/
+
+# Frontend vendor files (generated during Docker build)
+public/vendor/
+
+# Old backup files
+*.old*
+*.old1
+*.old2
+*.old3
+*.old4
+*.old5
+
+# Synology metadata
+@eaDir/
+@tmp/
+.SynologyWorkingDirectory
+
+# Package lock (generated during Docker build)
+package-lock.json
+
+# Logs and OS files
+*.log
+.DS_Store

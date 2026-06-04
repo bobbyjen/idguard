@@ -1,0 +1,55 @@
+services:
+
+  app:
+    build: .
+    container_name: idguard-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file: .env
+    secrets:
+      - gmail_user
+      - gmail_app_password
+      - twilio_sid
+      - twilio_token
+      - twilio_phone
+      - db_password
+      - admin_secret
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    container_name: idguard-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=idguard
+      - POSTGRES_USER=idguard
+      - POSTGRES_PASSWORD_FILE=/run/secrets/db_password
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U idguard"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+secrets:
+  gmail_user:
+    file: ./secrets/gmail_user.txt
+  gmail_app_password:
+    file: ./secrets/gmail_app_password.txt
+  twilio_sid:
+    file: ./secrets/twilio_sid.txt
+  twilio_token:
+    file: ./secrets/twilio_token.txt
+  twilio_phone:
+    file: ./secrets/twilio_phone.txt
+  db_password:
+    file: ./secrets/db_password.txt
+  admin_secret:
+    file: ./secrets/admin_secret.txt
