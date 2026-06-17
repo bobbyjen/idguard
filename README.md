@@ -1,7 +1,23 @@
 # IDGuard — Travel Document Expiry Tracker
 
 Never get turned away at the airport for an expired passport or license again.
-IDGuard tracks your IDs and sends email/SMS reminders well before they expire.
+IDGuard tracks your IDs and sends email and SMS reminders well before they expire.
+
+> ⚠️ Never commit the `secrets/` folder or `.env` file.
+> All credentials are managed via Docker secrets — see deployment section.
+
+---
+
+## Features
+
+- Tracks passports, driver's licenses, REAL ID, Global Entry, NEXUS, TSA PreCheck, Green Cards, and more
+- Visual countdown ring per document with colour-coded urgency (green → amber → red)
+- Configurable alert thresholds per document (e.g. 180, 90, 30, 7 days before expiry)
+- Email alerts via Gmail (Nodemailer)
+- SMS alerts via Twilio (optional)
+- International travel 6-month passport validity warning
+- Daily scheduler fires at 9 AM — one alert per threshold, not a daily flood
+- Self-hosted on a home NAS with no recurring SaaS fees
 
 ---
 
@@ -9,20 +25,17 @@ IDGuard tracks your IDs and sends email/SMS reminders well before they expire.
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                      Frontend                       │
-│  React SPA (IDGuard.jsx)                            │
-│  • Add/edit/delete documents                        │
-│  • Visual countdown rings per document              │
-│  • Alert channel config (email + SMS)               │
-│  • Persistent storage (window.storage / localStorage)│
+│               Browser (Home LAN or HTTPS)           │
+│   React + htm (no build step, no Babel)             │
+│   Served as static files from Express               │
 └────────────────────┬────────────────────────────────┘
-                     │ REST API (JSON)
+                     │ HTTP REST API
                      ▼
 ┌─────────────────────────────────────────────────────┐
-│                  idguard-server.js                  │
-│  Express + Node.js                                  │
+│         idguard-server.js (Node.js 20)              │
+│         Express 4 · port 3000                       │
 │                                                     │
-│  Routes:                                            │
+│  REST API:                                          │
 │    GET    /api/documents       — list all           │
 │    POST   /api/documents       — create             │
 │    PUT    /api/documents/:id   — update             │
@@ -31,74 +44,92 @@ IDGuard tracks your IDs and sends email/SMS reminders well before they expire.
 │    POST   /api/admin/run-check — manual trigger     │
 │    GET    /health                                   │
 │                                                     │
-│  Daily Cron (9 AM):                                 │
-│    → Query documents expiring at configured windows │
-│    → Send email via SendGrid                        │
-│    → Send SMS via Twilio                            │
-│    → Log results to alert_log table                 │
-└────────────────┬───────────────────────────────────┘
-                 │
-       ┌─────────┴────────┐
-       ▼                  ▼
-┌──────────────┐   ┌─────────────────────────────────┐
-│  PostgreSQL  │   │  Notification Services           │
-│  schema.sql  │   │  • SendGrid  → HTML email        │
-│              │   │  • Twilio    → SMS               │
-│  documents   │   └─────────────────────────────────┘
-│  alert_log   │
-└──────────────┘
+│  Static files:  /public/index.html + /public/app.js │
+│  Scheduler:     node-cron · 9:00 AM daily           │
+└──────────┬──────────────────┬───────────────────────┘
+           │                  │
+           ▼                  ▼
+┌──────────────────┐  ┌──────────────────────────────┐
+│   PostgreSQL 16  │  │  Notification Services        │
+│   Docker volume  │  │  · Nodemailer + Gmail SMTP    │
+│                  │  │  · Twilio SMS (optional)      │
+│  documents       │  └──────────────────────────────┘
+│  alert_log       │
+└──────────────────┘
+
+All containers run via Docker Compose.
+Credentials stored as Docker secrets (tmpfs, never written to disk).
 ```
 
 ---
 
-## Quick Start
+## Deployment (Synology NAS / Docker Compose)
 
-### 1. Clone and install dependencies
+### 1. Prerequisites
+
+- Synology NAS with Container Manager installed (DSM 7+)
+- SSH access enabled (Control Panel → Terminal & SNMP)
+
+### 2. Clone the repo
 
 ```bash
-git clone <your-repo>
+git clone https://github.com/bobbyjen/idguard.git
 cd idguard
-npm install
 ```
 
-### 2. Set up PostgreSQL
+### 3. Create the secrets folder
+
+All credentials are stored as Docker secrets — never in plain text files or environment variables.
 
 ```bash
-# Create the database
-createdb idguard
+mkdir -p secrets
 
-# Run the schema
-psql idguard -f schema.sql
+# Gmail credentials (for email alerts)
+echo "your.address@gmail.com"  > secrets/gmail_user.txt
+echo "xxxx xxxx xxxx xxxx"     > secrets/gmail_app_password.txt  # Google App Password
+
+# Twilio (optional — use placeholder if not configuring SMS yet)
+echo "placeholder"  > secrets/twilio_sid.txt
+echo "placeholder"  > secrets/twilio_token.txt
+echo "placeholder"  > secrets/twilio_phone.txt
+
+# Database and admin
+openssl rand -base64 32 > secrets/db_password.txt
+openssl rand -base64 32 > secrets/admin_secret.txt
+
+chmod 600 secrets/*.txt
 ```
 
-### 3. Configure environment variables
+To generate a Gmail App Password: Google Account → Security → 2-Step Verification → App passwords.
 
-Create a `.env` file:
+### 4. Create the .env file (non-secret config only)
 
-```env
-DATABASE_URL=postgresql://localhost:5432/idguard
-SENDGRID_API_KEY=SG.xxxxxxxxxxxxxxxxxx
-FROM_EMAIL=alerts@yourdomain.com
-
-TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-TWILIO_PHONE_NUMBER=+15550001234
-
-ADMIN_SECRET=your-secret-key-here
+```bash
+cat > .env << 'ENVEOF'
 PORT=3000
-TZ=America/New_York
+TZ=America/Los_Angeles
+FROM_EMAIL=your.address@gmail.com
+ALLOWED_ORIGINS=*
+ENVEOF
 ```
 
-### 4. Run the server
+### 5. Create the data directory
 
 ```bash
-# Development
-node idguard-server.js
+mkdir -p data/postgres
+```
 
-# Production (with PM2)
-pm2 start idguard-server.js --name idguard
-pm2 save
-pm2 startup
+### 6. Build and launch
+
+```bash
+sudo docker compose up -d --build
+```
+
+### 7. Verify
+
+```bash
+curl http://localhost:3000/health
+# {"status":"ok","timestamp":"..."}
 ```
 
 ---
@@ -106,26 +137,29 @@ pm2 startup
 ## Notification Logic
 
 ### When alerts fire
+
 Each document has an `alert_advance_days` array (e.g. `[180, 90, 30, 7]`).
-The daily cron job fires an alert whenever **today's day count matches
-one of those thresholds**. Example: if a passport expires in exactly 90 days,
-the 90-day alert is sent.
+The daily cron job fires an alert when `days_remaining` exactly matches one of
+those thresholds. Alerts also fire on day 0 (expiry day) and day -1.
+This means one alert per threshold — not a daily flood.
 
-Additionally, alerts fire on day 0 (expiry day) and day -1 (one day after expiry).
+### Passport 6-month rule
 
-### International travel — the 6-month rule
-For passports, IDGuard also computes a "travel safe" window:
+For US passports and passport cards, IDGuard computes a travel safe window:
+
 ```
 safe_travel_days = days_remaining - 180
 ```
-Most countries require at least 6 months of passport validity beyond
-your return date. The frontend surfaces this as a secondary warning.
+
+Most countries require at least 6 months of passport validity beyond your
+return date. The frontend and email template both surface this as a warning.
 
 ---
 
 ## API Reference
 
 ### Create a document
+
 ```http
 POST /api/documents
 Content-Type: application/json
@@ -133,7 +167,7 @@ Content-Type: application/json
 {
   "holder_name": "Jane Smith",
   "doc_type": "us_passport",
-  "expiry_date": "2026-03-15",
+  "expiry_date": "2027-03-15",
   "alert_email": "jane@example.com",
   "alert_phone": "+15551234567",
   "alert_channels": ["email", "sms"],
@@ -143,77 +177,84 @@ Content-Type: application/json
 ```
 
 ### Send a test alert
+
 ```http
 POST /api/documents/:id/test-alert
 ```
 
 ### Trigger manual daily check
+
 ```http
 POST /api/admin/run-check
-x-admin-secret: your-secret-key-here
-```
-
----
-
-## Deployment
-
-### Railway (recommended for simplicity)
-```bash
-railway login
-railway init
-railway add --database postgresql
-railway up
-```
-
-Set the env vars in the Railway dashboard. Railway provides
-`DATABASE_URL` automatically when you add the PostgreSQL plugin.
-
-### Render
-1. Create a new Web Service pointing to your repo.
-2. Set build command: `npm install`
-3. Set start command: `node idguard-server.js`
-4. Add a PostgreSQL database from Render's dashboard.
-5. Set all env vars in the Render dashboard.
-
-### Docker
-```dockerfile
-FROM node:20-alpine
-WORKDIR /app
-COPY package*.json .
-RUN npm ci --only=production
-COPY . .
-EXPOSE 3000
-CMD ["node", "idguard-server.js"]
+x-admin-secret: <value from secrets/admin_secret.txt>
 ```
 
 ---
 
 ## Document Types Supported
 
-| ID                 | type key            | Notes                          |
-|--------------------|---------------------|--------------------------------|
-| US Passport        | `us_passport`       | 6-month travel rule applies    |
-| Passport Card      | `us_passport_card`  | 6-month travel rule applies    |
-| Driver's License   | `drivers_license`   | State-issued, 4–8 year cycle   |
-| REAL ID            | `real_id`           | Required for domestic air travel|
-| Global Entry       | `global_entry`      | 5-year renewal                 |
-| NEXUS Card         | `nexus`             | 5-year renewal                 |
-| TSA PreCheck       | `tsa_precheck`      | 5-year renewal                 |
-| Green Card / PR    | `green_card`        | 10-year renewal                |
-| Military ID        | `military_id`       |                                |
-| Other              | `other`             |                                |
+| Document         | type key           | Typical cycle  | Notes                              |
+|------------------|--------------------|----------------|------------------------------------|
+| US Passport      | `us_passport`      | 10 years       | 6-month travel rule applies        |
+| Passport Card    | `us_passport_card` | 10 years       | 6-month travel rule; land/sea only |
+| Driver's License | `drivers_license`  | 4–8 years      | Required for domestic air travel   |
+| REAL ID          | `real_id`          | Same as license| Star marking; federal facilities   |
+| Global Entry     | `global_entry`     | 5 years        | Includes TSA PreCheck              |
+| NEXUS Card       | `nexus`            | 5 years        | Canada/US border programme         |
+| TSA PreCheck     | `tsa_precheck`     | 5 years        | Expedited domestic screening       |
+| Green Card / PR  | `green_card`       | 10 years       | Permanent Resident Card            |
+| Military ID      | `military_id`      | Varies         |                                    |
+| Other            | `other`            | —              | Generic fallback                   |
 
 ---
 
-## Security Notes
+## Security
 
-- **Never store full document numbers** unless you encrypt them at rest.
-  The `doc_number` field is optional for this reason.
-- Use HTTPS in production (Render, Railway both provide this automatically).
-- Rotate your `ADMIN_SECRET` regularly.
-- Consider adding user authentication (Clerk, Auth0, or custom JWT)
-  to scope documents per user in a multi-tenant deployment.
-- SendGrid and Twilio API keys should have the minimum required permissions.
+- **Docker secrets** — all credentials (Gmail, Twilio, DB password, admin secret) are
+  mounted as tmpfs inside containers at `/run/secrets/`. Never written to disk, never
+  visible in `docker inspect`.
+- **Content Security Policy** — helmet enforces strict CSP. All scripts served locally
+  from `/vendor/` and `/app.js` — no external CDN dependencies, no `unsafe-eval`.
+- **HSTS disabled** — intentional for local HTTP deployment. Enable once HTTPS is
+  configured via DSM reverse proxy + Let's Encrypt.
+- **Data minimisation** — `doc_number` field is optional. No biometric data or full
+  document scans are stored.
+- **Admin endpoint** — `/api/admin/run-check` requires an `x-admin-secret` header
+  matching the value in `secrets/admin_secret.txt`.
+
+---
+
+## HTTPS Setup (optional but recommended)
+
+For external access or user authentication, set up HTTPS via DSM:
+
+1. **DDNS** — Control Panel → External Access → DDNS → Add (Synology provider)
+2. **Port forwarding** — Forward ports 80 and 443 on your router to the NAS IP
+3. **Let's Encrypt** — Control Panel → Security → Certificate → Add → Let's Encrypt
+4. **Reverse Proxy** — Control Panel → Login Portal → Advanced → Reverse Proxy
+   - Source: `https://yourname.synology.me:443`
+   - Destination: `http://localhost:3000`
+5. Update `ALLOWED_ORIGINS` in `.env` to `https://yourname.synology.me`
+
+---
+
+## Activating SMS (Twilio)
+
+1. Sign up at twilio.com and get an Account SID, Auth Token, and phone number
+2. Replace the placeholder values:
+
+```bash
+echo "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" > secrets/twilio_sid.txt
+echo "your-auth-token"                   > secrets/twilio_token.txt
+echo "+15550001234"                      > secrets/twilio_phone.txt
+chmod 600 secrets/twilio_*.txt
+```
+
+3. Rebuild:
+
+```bash
+sudo docker compose up -d --build
+```
 
 ---
 
