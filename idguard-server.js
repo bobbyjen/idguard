@@ -6,6 +6,7 @@
  */
 
 require("dotenv").config();
+const crypto     = require("crypto");
 const fs         = require("fs");
 const path       = require("path");
 const express    = require("express");
@@ -26,6 +27,58 @@ function secret(name, envFallback) {
   } catch {
     return process.env[envFallback || name.toUpperCase()];
   }
+}
+
+// ─── HTML Escaping ────────────────────────────────────────────────────────────
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#x27;");
+}
+
+// ─── Input Validation ─────────────────────────────────────────────────────────
+
+const ALLOWED_DOC_TYPES = new Set([
+  "us_passport", "us_passport_card", "drivers_license", "real_id",
+  "global_entry", "nexus", "tsa_precheck", "green_card", "military_id", "other",
+]);
+
+function validateDocumentInput({ holder_name, doc_type, expiry_date, alert_email, alert_advance_days }) {
+  if (!holder_name || typeof holder_name !== "string" || holder_name.trim().length === 0) {
+    return "holder_name is required";
+  }
+  if (holder_name.length > 200) return "holder_name too long";
+  if (!doc_type || !ALLOWED_DOC_TYPES.has(doc_type)) return "Invalid doc_type";
+  if (!expiry_date || !/^\d{4}-\d{2}-\d{2}$/.test(expiry_date) || isNaN(Date.parse(expiry_date))) {
+    return "expiry_date must be a valid date in YYYY-MM-DD format";
+  }
+  if (alert_email !== undefined && alert_email !== null && alert_email !== "") {
+    if (typeof alert_email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(alert_email)) {
+      return "alert_email is not a valid email address";
+    }
+  }
+  if (alert_advance_days !== undefined && alert_advance_days !== null) {
+    if (!Array.isArray(alert_advance_days) || !alert_advance_days.every(d => Number.isInteger(d) && d > 0 && d <= 3650)) {
+      return "alert_advance_days must be an array of positive integers (max 3650)";
+    }
+  }
+  return null;
+}
+
+// ─── Rate Limiter (test-alert) ────────────────────────────────────────────────
+// Allows one test alert per document per 60 seconds.
+
+const testAlertLastSent = new Map();
+function isTestAlertRateLimited(docId) {
+  const now  = Date.now();
+  const last = testAlertLastSent.get(docId) || 0;
+  if (now - last < 60_000) return true;
+  testAlertLastSent.set(docId, now);
+  return false;
 }
 
 // ─── Field Parser ─────────────────────────────────────────────────────────────
@@ -106,7 +159,8 @@ app.get("/api/documents", async (req, res) => {
     const { rows } = await query("SELECT * FROM documents ORDER BY expiry_date ASC");
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("GET /api/documents:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -117,9 +171,8 @@ app.post("/api/documents", async (req, res) => {
     alert_email, alert_phone, alert_channels, alert_advance_days, notes,
   } = req.body;
 
-  if (!holder_name || !doc_type || !expiry_date) {
-    return res.status(400).json({ error: "holder_name, doc_type, and expiry_date are required" });
-  }
+  const validationError = validateDocumentInput({ holder_name, doc_type, expiry_date, alert_email, alert_advance_days });
+  if (validationError) return res.status(400).json({ error: validationError });
 
   try {
     const { rows } = await query(
@@ -129,7 +182,7 @@ app.post("/api/documents", async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        RETURNING *`,
       [
-        holder_name, doc_type, doc_number || null, expiry_date,
+        holder_name.trim(), doc_type, doc_number || null, expiry_date,
         alert_email || null, alert_phone || null,
         JSON.stringify(alert_channels || ["email"]),
         JSON.stringify(alert_advance_days || [180, 90, 30, 7]),
@@ -138,7 +191,8 @@ app.post("/api/documents", async (req, res) => {
     );
     res.status(201).json(rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("POST /api/documents:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -150,6 +204,9 @@ app.put("/api/documents/:id", async (req, res) => {
     alert_email, alert_phone, alert_channels, alert_advance_days, notes,
   } = req.body;
 
+  const validationError = validateDocumentInput({ holder_name, doc_type, expiry_date, alert_email, alert_advance_days });
+  if (validationError) return res.status(400).json({ error: validationError });
+
   try {
     const { rows } = await query(
       `UPDATE documents SET
@@ -158,7 +215,7 @@ app.put("/api/documents/:id", async (req, res) => {
          alert_advance_days=$8, notes=$9, updated_at=NOW()
        WHERE id=$10 RETURNING *`,
       [
-        holder_name, doc_type, doc_number || null, expiry_date,
+        holder_name.trim(), doc_type, doc_number || null, expiry_date,
         alert_email || null, alert_phone || null,
         JSON.stringify(alert_channels || ["email"]),
         JSON.stringify(alert_advance_days || [180, 90, 30, 7]),
@@ -168,29 +225,36 @@ app.put("/api/documents/:id", async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("PUT /api/documents/:id:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // DELETE /api/documents/:id
 app.delete("/api/documents/:id", async (req, res) => {
   try {
-    await query("DELETE FROM documents WHERE id=$1", [req.params.id]);
+    const result = await query("DELETE FROM documents WHERE id=$1", [req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: "Not found" });
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("DELETE /api/documents/:id:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // POST /api/documents/:id/test-alert
 app.post("/api/documents/:id/test-alert", async (req, res) => {
+  if (isTestAlertRateLimited(req.params.id)) {
+    return res.status(429).json({ error: "Test alert already sent recently — wait 60 seconds before retrying" });
+  }
   try {
     const { rows } = await query("SELECT * FROM documents WHERE id=$1", [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     const results = await sendAlerts(rows[0], true);
     res.json({ success: true, results });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("POST /api/documents/:id/test-alert:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -226,13 +290,14 @@ function urgencyLabel(days) {
 }
 
 function emailHtml(doc, days) {
-  const label      = DOC_TYPE_LABELS[doc.doc_type] || "ID Document";
-  const exp        = new Date(doc.expiry_date).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
-  const urgency    = urgencyLabel(days);
+  const label      = escapeHtml(DOC_TYPE_LABELS[doc.doc_type] || "ID Document");
+  const holderName = escapeHtml(doc.holder_name);
+  const exp        = escapeHtml(new Date(doc.expiry_date).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" }));
+  const urgency    = escapeHtml(urgencyLabel(days));
   const color      = days < 30 ? "#ef4444" : days < 90 ? "#f59e0b" : "#3b82f6";
   const isPassport = doc.doc_type === "us_passport" || doc.doc_type === "us_passport_card";
   const travelSafe = isPassport ? days - 180 : null;
-  const advDays    = parseField(doc.alert_advance_days, []).join("d, ");
+  const advDays    = escapeHtml(parseField(doc.alert_advance_days, []).filter(d => Number.isInteger(d)).join("d, "));
 
   return `<!DOCTYPE html>
 <html>
@@ -253,7 +318,7 @@ function emailHtml(doc, days) {
           ${days < 0 ? "Your document has expired" : `${label} expiring ${days <= 30 ? "very soon" : "soon"}`}
         </h1>
         <p style="color:#6b7280;font-size:15px;line-height:1.6;margin:0 0 28px">
-          ${doc.holder_name}'s ${label} ${days < 0 ? `expired <strong>${Math.abs(days)} days ago</strong>` : `expires in <strong>${days} day${days !== 1 ? "s" : ""}</strong>`} on <strong>${exp}</strong>.
+          ${holderName}'s ${label} ${days < 0 ? `expired <strong>${Math.abs(days)} days ago</strong>` : `expires in <strong>${days} day${days !== 1 ? "s" : ""}</strong>`} on <strong>${exp}</strong>.
         </p>
         ${travelSafe !== null ? `
         <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:14px 18px;margin-bottom:28px">
@@ -267,7 +332,7 @@ function emailHtml(doc, days) {
         <div style="background:#f9fafb;border-radius:10px;padding:18px;margin-bottom:28px">
           <table width="100%" cellpadding="4" cellspacing="0" style="font-size:13px">
             <tr><td style="color:#9ca3af;width:140px">Document type</td><td style="color:#111827;font-weight:500">${label}</td></tr>
-            <tr><td style="color:#9ca3af">Holder</td><td style="color:#111827;font-weight:500">${doc.holder_name}</td></tr>
+            <tr><td style="color:#9ca3af">Holder</td><td style="color:#111827;font-weight:500">${holderName}</td></tr>
             <tr><td style="color:#9ca3af">Expiry date</td><td style="color:${color};font-weight:600">${exp}</td></tr>
             <tr><td style="color:#9ca3af">Days remaining</td><td style="color:${color};font-weight:600">${days < 0 ? "Expired" : days}</td></tr>
           </table>
@@ -375,7 +440,11 @@ cron.schedule("0 9 * * *", runDailyCheck, {
 
 // Manual trigger (protected by admin secret)
 app.post("/api/admin/run-check", async (req, res) => {
-  if (req.headers["x-admin-secret"] !== secret("admin_secret", "ADMIN_SECRET")) {
+  const provided = req.headers["x-admin-secret"] || "";
+  const expected = secret("admin_secret", "ADMIN_SECRET") || "";
+  const match = provided.length === expected.length &&
+    crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+  if (!match) {
     return res.status(401).json({ error: "Unauthorized" });
   }
   await runDailyCheck();
