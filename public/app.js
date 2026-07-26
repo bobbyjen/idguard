@@ -36,6 +36,49 @@
   };
   const fmtDate = s => new Date(dateStr(s) + "T00:00:00").toLocaleDateString("en-US", { month:"short", day:"numeric", year:"numeric" });
 
+  // ── Alert result copy ──────────────────────────────────────────────────
+  // The server's sendAlerts() already returns per-channel status:
+  //   { email: "sent" | "error: …" | null, sms: "sent" | "error: …" | "skipped: …" | null }
+  // Report each channel by name instead of collapsing everything that isn't a
+  // clean email success into "check server logs" — the people using this are
+  // family members, not operators.
+  //
+  //   email    sms      → message                                    colour
+  //   ───────  ───────  ─────────────────────────────────────────────  ──────
+  //   sent     sent     ✓ Email sent · SMS sent                       green
+  //   sent     error    Email sent · SMS failed — check server logs   amber
+  //   sent     skipped  Email sent · SMS skipped (not configured)     amber
+  //   error    —        Email failed — check server logs              red
+  //   null     null     No alert channels are configured…             amber
+  function describeAlertResults(results) {
+    const r = results || {};
+    const stateOf = v => {
+      if (v === "sent") return "sent";
+      if (typeof v === "string" && v.indexOf("skipped") === 0) return "skipped";
+      if (typeof v === "string") return "failed";
+      return "off";
+    };
+    const e = stateOf(r.email), s = stateOf(r.sms);
+
+    if (e === "off" && s === "off") {
+      return { msg: "No alert channels are configured for this document", color: "#f59e0b" };
+    }
+
+    const bits = [];
+    if (e !== "off") bits.push("Email " + e);
+    if (s !== "off") bits.push("SMS " + s);
+
+    const anyFailed  = e === "failed"  || s === "failed";
+    const anySkipped = e === "skipped" || s === "skipped";
+    const anySent    = e === "sent"    || s === "sent";
+
+    const suffix = anyFailed ? " — check server logs" : anySkipped ? " (not configured)" : "";
+    const color  = anyFailed ? (anySent ? "#f59e0b" : "#ef4444") : anySkipped ? "#f59e0b" : "#22c55e";
+    const prefix = !anyFailed && !anySkipped ? "✓ " : "";
+
+    return { msg: prefix + bits.join(" · ") + suffix, color };
+  }
+
   // ── API ────────────────────────────────────────────────────────────────
   async function api(path, opts = {}) {
     const res  = await fetch("/api" + path, { headers:{ "Content-Type":"application/json" }, ...opts });
@@ -110,9 +153,12 @@
             ${doc.alert_email && html`<div class="demail">✉ ${doc.alert_email}</div>`}
           </div>
           <div class="acts">
-            <button class=${"ab test" + (testing ? " sending" : "")} onClick=${handleTest} title="Send test alert">📧</button>
-            <button class="ab" onClick=${() => onEdit(doc)} title="Edit">✏️</button>
-            <button class="ab del" onClick=${() => onDelete(doc.id)} title="Delete">🗑️</button>
+            <button class=${"ab test" + (testing ? " sending" : "")} onClick=${handleTest}
+              title="Send test alert" aria-label=${"Send test alert for " + doc.holder_name + "'s " + dt.label}>📧</button>
+            <button class="ab" onClick=${() => onEdit(doc)}
+              title="Edit" aria-label=${"Edit " + doc.holder_name + "'s " + dt.label}>✏️</button>
+            <button class="ab del" onClick=${() => onDelete(doc.id)}
+              title="Delete" aria-label=${"Delete " + doc.holder_name + "'s " + dt.label}>🗑️</button>
           </div>
         </div>
       </div>
@@ -133,17 +179,35 @@
       alert_advance_days: Array.isArray(doc.alert_advance_days) ? doc.alert_advance_days : [180, 90, 30, 7],
     } : blank);
 
+    // Required-field errors stay hidden until a field is blurred or the user
+    // attempts to save, so nothing shouts at someone who hasn't typed yet.
+    const [touched, setTouched] = useState({});
+
     const set    = (k, v) => setF(p => Object.assign({}, p, { [k]: v }));
+    const mark   = k => setTouched(p => Object.assign({}, p, { [k]: true }));
     const togCh  = c => set("alert_channels",     f.alert_channels.includes(c)     ? f.alert_channels.filter(x => x !== c)     : f.alert_channels.concat(c));
     const togDay = d => set("alert_advance_days", f.alert_advance_days.includes(d) ? f.alert_advance_days.filter(x => x !== d) : f.alert_advance_days.concat(d).sort((a,b) => b - a));
-    const canSave = !saving && f.holder_name.trim() && f.expiry_date;
+
+    const errors = {
+      holder_name: f.holder_name.trim() ? null : "Holder name is required",
+      expiry_date: f.expiry_date        ? null : "Expiry date is required",
+    };
+    const errFor  = k => (touched[k] ? errors[k] : null);
+    const isValid = !errors.holder_name && !errors.expiry_date;
+
+    // The button stays clickable while invalid: a disabled button that never
+    // says why is the exact problem this change exists to fix.
+    const attemptSave = () => {
+      if (!isValid) { setTouched({ holder_name: true, expiry_date: true }); return; }
+      onSave(f);
+    };
 
     return html`
       <div class="ov" onClick=${e => e.target === e.currentTarget && onClose()}>
         <div class="modal">
           <div class="mh">
             <div class="mtitle">${doc ? "Edit Document" : "Add Document"}</div>
-            <button class="xb" onClick=${onClose}>×</button>
+            <button class="xb" onClick=${onClose} title="Close" aria-label="Close dialog">×</button>
           </div>
 
           <div class="fg">
@@ -155,14 +219,21 @@
 
           <div class="fg">
             <label class="fl">Holder Name</label>
-            <input class="fi" placeholder="Full name as on document"
-              value=${f.holder_name} onChange=${e => set("holder_name", e.target.value)}/>
+            <input class=${"fi" + (errFor("holder_name") ? " err" : "")} placeholder="Full name as on document"
+              aria-label="Holder name" aria-invalid=${errFor("holder_name") ? "true" : null}
+              value=${f.holder_name} onBlur=${() => mark("holder_name")}
+              onChange=${e => set("holder_name", e.target.value)}/>
+            ${errFor("holder_name") && html`<span class="ferr">${errFor("holder_name")}</span>`}
           </div>
 
           <div class="fr">
             <div class="fg">
               <label class="fl">Expiry Date</label>
-              <input class="fi" type="date" value=${f.expiry_date} onChange=${e => set("expiry_date", e.target.value)}/>
+              <input class=${"fi" + (errFor("expiry_date") ? " err" : "")} type="date"
+                aria-label="Expiry date" aria-invalid=${errFor("expiry_date") ? "true" : null}
+                value=${f.expiry_date} onBlur=${() => mark("expiry_date")}
+                onChange=${e => set("expiry_date", e.target.value)}/>
+              ${errFor("expiry_date") && html`<span class="ferr">${errFor("expiry_date")}</span>`}
             </div>
             <div class="fg">
               <label class="fl">Doc # (optional)</label>
@@ -216,7 +287,7 @@
 
           <div class="ma">
             <button class="bts" onClick=${onClose}>Cancel</button>
-            <button class="btp" disabled=${!canSave} onClick=${() => onSave(f)}>
+            <button class="btp" disabled=${saving} onClick=${attemptSave}>
               ${saving ? "Saving…" : doc ? "Save Changes" : "Add Document"}
             </button>
           </div>
@@ -232,6 +303,7 @@
       { icon:"📧", title:"Email via Gmail",        desc:"HTML reminder emails sent from your Gmail account. Click 📧 on any card to send a test alert immediately." },
       { icon:"💬", title:"SMS via Twilio",         desc:"Text message reminders. Replace the placeholder Twilio secrets and rebuild to activate." },
       { icon:"✈️", title:"Passport 6-month rule", desc:"For US passports, IDGuard shows your safe international travel window — most countries require 6 months of validity beyond your return date." },
+      { icon:"🔒", title:"Self-hosted by design",  desc:"Your documents stay on your own server. Alerts go out through your own Gmail and Twilio accounts, never through a third-party IDGuard service." },
     ];
     return html`
       <div>
@@ -349,9 +421,8 @@
     const testAlert = async id => {
       try {
         const res = await api("/documents/" + id + "/test-alert", { method:"POST" });
-        showToast(res.results && res.results.email === "sent"
-          ? "✓ Test email sent — check your inbox"
-          : "Alert triggered (check server logs)", "#d4a843");
+        const outcome = describeAlertResults(res.results);
+        showToast(outcome.msg, outcome.color);
       } catch (err) {
         showToast("Alert failed: " + err.message, "#ef4444");
       }
@@ -366,12 +437,15 @@
 
     return html`
       <div class="shell">
-        <nav class="sidebar">
-          <div class="logo">🛂</div>
-          <button class=${"nb" + (view === "dash"     ? " on" : "")} onClick=${() => setView("dash")}     title="Dashboard">⊞</button>
-          <button class=${"nb" + (view === "settings" ? " on" : "")} onClick=${() => setView("settings")} title="Settings">⚙</button>
+        <nav class="sidebar" aria-label="Main navigation">
+          <div class="logo" aria-hidden="true">🛂</div>
+          <div class="wordmark">IDGuard</div>
+          <button class=${"nb" + (view === "dash" ? " on" : "")} onClick=${() => setView("dash")}
+            title="Dashboard" aria-label="Dashboard" aria-current=${view === "dash" ? "page" : null}>⊞</button>
+          <button class=${"nb" + (view === "settings" ? " on" : "")} onClick=${() => setView("settings")}
+            title="Settings" aria-label="Settings" aria-current=${view === "settings" ? "page" : null}>⚙</button>
           <span class="spc"/>
-          <button class="nb" title="Refresh" onClick=${loadDocs}>↻</button>
+          <button class="nb" title="Refresh" aria-label="Refresh documents" onClick=${loadDocs}>↻</button>
         </nav>
 
         <main class="main">
@@ -446,7 +520,7 @@
         </main>
 
         ${view === "dash" && html`
-          <button class="fab" onClick=${() => setModal({})} title="Add document">+</button>
+          <button class="fab" onClick=${() => setModal({})} title="Add document" aria-label="Add document">+</button>
         `}
 
         ${modal !== null && html`
