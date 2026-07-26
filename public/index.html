@@ -140,6 +140,12 @@
         position:fixed;bottom:0;left:0;right:0;
       }
       .logo,.wordmark,.spc{display:none}
+      /* Size targets on width too, not only pointer type: some touch devices
+         (hybrid laptops, stylus tablets) report `pointer:fine` and would
+         otherwise miss the 44px minimum entirely. */
+      .acts{opacity:1}
+      .ab,.nb,.xb{width:44px;height:44px}
+      .ab{font-size:16px}
       .main{padding:20px 16px calc(78px + env(safe-area-inset-bottom))}
       .fab{bottom:calc(78px + env(safe-area-inset-bottom));right:16px}
       /* active indicator flips from a left bar to a top bar */
