@@ -3,6 +3,24 @@
 (function () {
   'use strict';
 
+  // Vendor bundles are generated at Docker build time and are gitignored, so
+  // "they didn't get staged" is a real deployment failure. Without this guard
+  // the next line throws, the LOADING placeholder never clears, and the page
+  // gives no clue which file is missing.
+  var missing = [];
+  if (typeof React    === "undefined") missing.push("/vendor/react.js");
+  if (typeof ReactDOM === "undefined") missing.push("/vendor/react-dom.js");
+  if (typeof htm      === "undefined") missing.push("/vendor/htm.js");
+  if (missing.length) {
+    var detail = "These scripts did not load: " + missing.join(", ") +
+      ". If you opened index.html directly from disk, serve it over HTTP instead — " +
+      "the app loads its scripts from absolute paths.";
+    if (window.idguardBootError) window.idguardBootError(detail);
+    else document.getElementById("boot").textContent = detail;
+    console.error("IDGuard: " + detail);
+    return;
+  }
+
   const { useState, useEffect, useCallback } = React;
   const html = htm.bind(React.createElement);
 
@@ -544,5 +562,6 @@
   document.getElementById("boot").style.display = "none";
   document.getElementById("root").style.display = "flex";
   ReactDOM.createRoot(document.getElementById("root")).render(html`<${IDGuardApp}/>`);
+  window.__IDGUARD_BOOTED__ = true;  // stands down the boot-check.js watchdog
 
 })();
